@@ -1,2 +1,0 @@
-# dbscan
-dbscan algorithm

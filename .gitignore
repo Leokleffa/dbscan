@@ -1,0 +1,15 @@
+# Arquivos gerados pela compilação
+bin/
+
+# Arquivos de dados (geralmente grandes e podem ser gerados por script)
+data/pontos_entrada.csv
+
+# Resultados dos experimentos
+results/
+
+# Arquivos de cache do Python
+__pycache__/
+*.pyc
+
+# Arquivos de core dump
+core.*
