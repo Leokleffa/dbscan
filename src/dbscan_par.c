@@ -1,261 +1,360 @@
+// dbscan_par.c — DBSCAN paralelo com OpenMP e Union-Find “lock-based”
+// Melhorias:
+// - Distância ao quadrado (evita sqrt/pow)
+// - Fase 1 (vizinhança + core) paralela
+// - Fase 2 (unions) paralela, com ordem de locks consistente
+// - Passo de compressão de caminho paralelo
+// - Fase 3 (rótulos de core + borda) paralela
+// - Checagens de alocação e mensagens de erro
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
 #include <stdbool.h>
+#include <string.h>
 #include <omp.h>
 
 // ============================================================================
-// ESTRUTURAS DE DADOS E CONSTANTES
+// PARÂMETROS E ESTRUTURAS
 // ============================================================================
-
 #define EPSILON 1.0
 #define MIN_POINTS 3
 #define UNCLASSIFIED 0
 #define NOISE -1
 
-typedef struct {
+typedef struct
+{
     double x, y;
     int cluster_id;
 } Point;
 
-typedef struct {
-    Point* points;
+typedef struct
+{
+    Point *points;
     int num_points;
 } Dataset;
 
-// Estrutura para Union-Find
-typedef struct {
-    int* parent;
-    omp_lock_t* locks; // Locks para garantir a segurança da união
-    int num_points;
+// Union-Find com locks por nó (para unions thread-safe)
+typedef struct
+{
+    int *parent;
+    omp_lock_t *locks;
+    int n;
 } UnionFind;
 
 // ============================================================================
-// FUNÇÕES DA ESTRUTURA UNION-FIND
+// FUNÇÕES AUXILIARES
 // ============================================================================
 
-void uf_init(UnionFind* uf, int n) {
-    uf->num_points = n;
-    uf->parent = (int*)malloc(n * sizeof(int));
-    uf->locks = (omp_lock_t*)malloc(n * sizeof(omp_lock_t));
-    for (int i = 0; i < n; i++) {
-        uf->parent[i] = i; // Cada ponto começa como seu próprio pai
+static inline int within_epsilon2(const Point *a, const Point *b)
+{
+    double dx = a->x - b->x;
+    double dy = a->y - b->y;
+    return (dx * dx + dy * dy) <= (EPSILON * EPSILON);
+}
+
+static void *xmalloc(size_t nbytes, const char *what)
+{
+    void *p = malloc(nbytes);
+    if (!p)
+    {
+        fprintf(stderr, "Falha ao alocar %s (%zu bytes)\n", what, nbytes);
+        exit(EXIT_FAILURE);
+    }
+    return p;
+}
+
+// ============================================================================
+// UNION-FIND (com locks)
+// ============================================================================
+
+static void uf_init(UnionFind *uf, int n)
+{
+    uf->n = n;
+    uf->parent = (int *)xmalloc((size_t)n * sizeof(int), "UF parent");
+    uf->locks = (omp_lock_t *)xmalloc((size_t)n * sizeof(omp_lock_t), "UF locks");
+    for (int i = 0; i < n; ++i)
+    {
+        uf->parent[i] = i;
         omp_init_lock(&uf->locks[i]);
     }
 }
 
-// Encontra o representante (raiz) do conjunto de um ponto com compressão de caminho
-int uf_find(UnionFind* uf, int i) {
-    if (uf->parent[i] == i) {
+static int uf_find(UnionFind *uf, int i)
+{
+    // find com compressão recursiva
+    if (uf->parent[i] == i)
         return i;
-    }
-    // Compressão de caminho: aponta diretamente para a raiz
     uf->parent[i] = uf_find(uf, uf->parent[i]);
     return uf->parent[i];
 }
 
-// Une dois conjuntos (thread-safe)
-void uf_union(UnionFind* uf, int i, int j) {
-    int root_i = uf_find(uf, i);
-    int root_j = uf_find(uf, j);
+static void uf_union(UnionFind *uf, int a, int b)
+{
+    int ra = uf_find(uf, a);
+    int rb = uf_find(uf, b);
+    if (ra == rb)
+        return;
 
-    if (root_i != root_j) {
-        // Garante uma ordem de bloqueio consistente para evitar deadlocks
-        if (root_i < root_j) {
-            omp_set_lock(&uf->locks[root_i]);
-            omp_set_lock(&uf->locks[root_j]);
-        } else {
-            omp_set_lock(&uf->locks[root_j]);
-            omp_set_lock(&uf->locks[root_i]);
-        }
-        
-        // Verifica novamente após adquirir o lock
-        int current_root_i = uf_find(uf, i);
-        int current_root_j = uf_find(uf, j);
-        if(current_root_i != current_root_j){
-            uf->parent[current_root_j] = current_root_i;
-        }
+    // ordem de lock consistente para evitar deadlock
+    int first = (ra < rb) ? ra : rb;
+    int second = (ra < rb) ? rb : ra;
 
-        omp_unset_lock(&uf->locks[root_i]);
-        omp_unset_lock(&uf->locks[root_j]);
+    omp_set_lock(&uf->locks[first]);
+    omp_set_lock(&uf->locks[second]);
+
+    // revalida após adquirir locks
+    ra = uf_find(uf, ra);
+    rb = uf_find(uf, rb);
+    if (ra != rb)
+    {
+        uf->parent[rb] = ra; // attach rb -> ra (heurística simples)
     }
+
+    omp_unset_lock(&uf->locks[second]);
+    omp_unset_lock(&uf->locks[first]);
 }
 
-void uf_destroy(UnionFind* uf) {
-    for (int i = 0; i < uf->num_points; i++) {
+static void uf_destroy(UnionFind *uf)
+{
+    for (int i = 0; i < uf->n; ++i)
+    {
         omp_destroy_lock(&uf->locks[i]);
     }
     free(uf->parent);
     free(uf->locks);
 }
 
-// ============================================================================
-// FUNÇÕES DO ALGORITMO DBSCAN
-// ============================================================================
-
-double euclidean_distance(Point p1, Point p2) {
-    return sqrt(pow(p1.x - p2.x, 2) + pow(p1.y - p2.y, 2));
+// Compressão de caminho paralela: acelera finds subsequentes
+static void uf_compress_all(UnionFind *uf)
+{
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < uf->n; ++i)
+    {
+        uf->parent[i] = uf_find(uf, i);
+    }
 }
 
-void dbscan(Dataset* data) {
-    int n = data->num_points;
-    int* neighbor_counts = (int*)calloc(n, sizeof(int));
-    int** neighbors = (int**)malloc(n * sizeof(int*));
-    bool* is_core = (bool*)calloc(n, sizeof(bool));
+// ============================================================================
+// DBSCAN
+// ============================================================================
 
-    // --- FASE 1: Encontrar vizinhos e pontos centrais (em paralelo) ---
-    #pragma omp parallel for schedule(dynamic)
-    for (int i = 0; i < n; i++) {
-        int capacity = 10;
-        neighbors[i] = (int*)malloc(capacity * sizeof(int));
-        for (int j = 0; j < n; j++) {
-            if (i == j) continue;
-            if (euclidean_distance(data->points[i], data->points[j]) <= EPSILON) {
-                if (neighbor_counts[i] >= capacity) {
-                    capacity *= 2;
-                    neighbors[i] = (int*)realloc(neighbors[i], capacity * sizeof(int));
-                }
-                neighbors[i][neighbor_counts[i]++] = j;
-            }
-        }
-        if (neighbor_counts[i] >= MIN_POINTS) {
-            is_core[i] = true;
-        }
+static void dbscan(Dataset *data)
+{
+    const int n = data->num_points;
+
+    // buffers: contagem de vizinhos, lista de vizinhos por ponto, e se é core
+    int *neighbor_counts = (int *)calloc((size_t)n, sizeof(int));
+    int **neighbors = (int **)xmalloc((size_t)n * sizeof(int *), "neighbors[]");
+    bool *is_core = (bool *)calloc((size_t)n, sizeof(bool));
+    if (!neighbor_counts || !neighbors || !is_core)
+    {
+        fprintf(stderr, "Falha ao alocar buffers principais\n");
+        exit(EXIT_FAILURE);
     }
 
-    // --- FASE 2: Unir clusters usando Union-Find (em paralelo) ---
+// ---------------- FASE 1: vizinhança + pontos core (paralela) ----------------
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; ++i)
+    {
+        int cap = 64;
+        int used = 0;
+        int *list = (int *)xmalloc((size_t)cap * sizeof(int), "neighbors[i]");
+
+        const Point *Pi = &data->points[i];
+        for (int j = 0; j < n; ++j)
+        {
+            if (i == j)
+                continue;
+            if (within_epsilon2(Pi, &data->points[j]))
+            {
+                if (used >= cap)
+                {
+                    int newcap = cap << 1;
+                    int *tmp = (int *)realloc(list, (size_t)newcap * sizeof(int));
+                    if (!tmp)
+                    {
+                        // fallback: mantém cap atual (raro), evita crash
+                    }
+                    else
+                    {
+                        list = tmp;
+                        cap = newcap;
+                    }
+                }
+                if (used < cap)
+                    list[used++] = j;
+            }
+        }
+        neighbors[i] = list;
+        neighbor_counts[i] = used;
+        if (used >= MIN_POINTS)
+            is_core[i] = true;
+    }
+
+    // ---------------- FASE 2: union de cores conectados (paralela) ---------------
     UnionFind uf;
     uf_init(&uf, n);
 
-    #pragma omp parallel for schedule(dynamic)
-    for (int i = 0; i < n; i++) {
-        if (!is_core[i]) continue;
-        for (int j = 0; j < neighbor_counts[i]; j++) {
-            int neighbor_idx = neighbors[i][j];
-            if (is_core[neighbor_idx]) {
-                uf_union(&uf, i, neighbor_idx);
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; ++i)
+    {
+        if (!is_core[i])
+            continue;
+        int deg = neighbor_counts[i];
+        int *list = neighbors[i];
+        for (int k = 0; k < deg; ++k)
+        {
+            int j = list[k];
+            if (is_core[j])
+            {
+                uf_union(&uf, i, j);
             }
         }
     }
 
-    // --- FASE 3: Atribuir IDs de cluster (em paralelo) ---
-    int* cluster_map = (int*)calloc(n, sizeof(int));
-    int cluster_id_counter = 1;
+    // Compressão de caminho paralela após unions
+    uf_compress_all(&uf);
 
-    // Mapeia a raiz de cada conjunto para um ID de cluster final
-    for (int i = 0; i < n; i++) {
-        if (!is_core[i]) continue;
-        int root = uf_find(&uf, i);
-        if (cluster_map[root] == 0) {
-            cluster_map[root] = cluster_id_counter++;
+    // Mapa raiz->cluster_id
+    int *cluster_map = (int *)calloc((size_t)n, sizeof(int));
+    if (!cluster_map)
+    {
+        fprintf(stderr, "Falha ao alocar cluster_map\n");
+        exit(EXIT_FAILURE);
+    }
+
+    int next_cluster_id = 1;
+    for (int i = 0; i < n; ++i)
+    {
+        if (!is_core[i])
+            continue;
+        int r = uf.parent[i]; // já comprimido
+        if (cluster_map[r] == 0)
+        {
+            cluster_map[r] = next_cluster_id++;
         }
     }
 
-    #pragma omp parallel for schedule(dynamic)
-    for (int i = 0; i < n; i++) {
-        if (is_core[i]) {
-            int root = uf_find(&uf, i);
-            data->points[i].cluster_id = cluster_map[root];
-        } else {
-            data->points[i].cluster_id = NOISE; // Começa como ruído
+// ---------------- FASE 3A: atribuir rótulo aos cores (paralela) --------------
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; ++i)
+    {
+        if (is_core[i])
+        {
+            int r = uf.parent[i];
+            data->points[i].cluster_id = cluster_map[r];
+        }
+        else
+        {
+            data->points[i].cluster_id = NOISE; // começa como ruído
         }
     }
-    
-    // Atribui pontos de borda ao cluster de um de seus vizinhos centrais
-    #pragma omp parallel for schedule(dynamic)
-    for (int i = 0; i < n; i++) {
-        if (!is_core[i]) {
-            for (int j = 0; j < neighbor_counts[i]; j++) {
-                int neighbor_idx = neighbors[i][j];
-                if (is_core[neighbor_idx]) {
-                    int root = uf_find(&uf, neighbor_idx);
-                    data->points[i].cluster_id = cluster_map[root];
-                    break;
-                }
+
+// ---------------- FASE 3B: atribuir rótulo aos borda (paralela) --------------
+// cada não-core herda de QUALQUER vizinho core (primeiro que achar)
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; ++i)
+    {
+        if (is_core[i])
+            continue;
+        int deg = neighbor_counts[i];
+        int *list = neighbors[i];
+        int label = NOISE;
+
+        for (int k = 0; k < deg; ++k)
+        {
+            int j = list[k];
+            if (is_core[j])
+            {
+                int r = uf.parent[j];
+                label = cluster_map[r];
+                break; // basta um core vizinho
             }
         }
+        data->points[i].cluster_id = label;
     }
 
-    // Liberar memória
-    free(cluster_map);
-    uf_destroy(&uf);
-    for (int i = 0; i < n; i++) free(neighbors[i]);
+    // limpeza
+    for (int i = 0; i < n; ++i)
+        free(neighbors[i]);
     free(neighbors);
     free(neighbor_counts);
     free(is_core);
+    free(cluster_map);
+    uf_destroy(&uf);
 }
-
 
 // ============================================================================
 // MAIN
 // ============================================================================
-int main(int argc, char *argv[]) {
-    if (argc != 3) {
+int main(int argc, char *argv[])
+{
+    if (argc != 3)
+    {
         fprintf(stderr, "Uso: %s <arquivo_entrada.csv> <arquivo_saida.csv>\n", argv[0]);
         return 1;
     }
-    const char* input_filename = argv[1];
-    const char* output_filename = argv[2];
+    const char *input_filename = argv[1];
+    const char *output_filename = argv[2];
 
-    FILE* infile = fopen(input_filename, "r");
-    if (!infile) {
-        perror("Erro ao abrir o arquivo de entrada");
+    FILE *in = fopen(input_filename, "r");
+    if (!in)
+    {
+        perror("Erro ao abrir entrada");
         return 1;
     }
 
-    int num_points = 0;
-    char buffer[1024];
-    while (fgets(buffer, sizeof(buffer), infile)) {
-        num_points++;
-    }
+    // contar linhas
+    int n = 0;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), in))
+        n++;
 
     Dataset data;
-    data.num_points = num_points;
-    data.points = (Point*)malloc(num_points * sizeof(Point));
-    if (!data.points) {
-        perror("Falha ao alocar memória para o dataset");
-        fclose(infile);
-        return 1;
-    }
+    data.num_points = n;
+    data.points = (Point *)xmalloc((size_t)n * sizeof(Point), "Dataset points");
 
-    rewind(infile);
-    for (int i = 0; i < num_points; ++i) {
-        if (fscanf(infile, "%lf,%lf", &data.points[i].x, &data.points[i].y) != 2) {
-            fprintf(stderr, "Erro ao ler a linha %d do arquivo de entrada.\n", i + 1);
+    // ler pontos (x,y), entrada sem cabeçalho
+    rewind(in);
+    for (int i = 0; i < n; ++i)
+    {
+        if (fscanf(in, "%lf,%lf", &data.points[i].x, &data.points[i].y) != 2)
+        {
+            fprintf(stderr, "Erro ao ler linha %d do arquivo\n", i + 1);
             free(data.points);
-            fclose(infile);
+            fclose(in);
             return 1;
         }
         data.points[i].cluster_id = UNCLASSIFIED;
     }
-    fclose(infile);
+    fclose(in);
 
-    printf("Iniciando DBSCAN Paralelo (Corrigido) em C com OpenMP...\n");
-    printf("Parâmetros: Epsilon = %.2f, MinPoints = %d\n", EPSILON, MIN_POINTS);
-    printf("Total de pontos lidos do arquivo '%s': %d\n\n", input_filename, data.num_points);
-    
-    double start_time = omp_get_wtime();
+    printf("Iniciando DBSCAN Paralelo (OpenMP)\n");
+    printf("Parâmetros: Epsilon=%.3f  MinPoints=%d  N=%d\n", EPSILON, MIN_POINTS, data.num_points);
+
+    double t0 = omp_get_wtime();
     dbscan(&data);
-    double end_time = omp_get_wtime();
-    printf("Tempo de execução do DBSCAN: %f segundos\n", end_time - start_time);
+    double t1 = omp_get_wtime();
+    double dt = t1 - t0;
+    if (dt < 0)
+        dt = 0;
+    printf("Tempo: %.6f s\n", dt);
 
-    FILE* outfile = fopen(output_filename, "w");
-    if (!outfile) {
-        perror("Erro ao abrir o arquivo de saída");
+    FILE *out = fopen(output_filename, "w");
+    if (!out)
+    {
+        perror("Erro ao abrir saída");
         free(data.points);
         return 1;
     }
-
-    fprintf(outfile, "x,y,cluster_id\n");
-    for (int i = 0; i < data.num_points; ++i) {
-        fprintf(outfile, "%.6f,%.6f,%d\n", data.points[i].x, data.points[i].y, data.points[i].cluster_id);
+    fprintf(out, "x,y,cluster_id\n");
+    for (int i = 0; i < data.num_points; ++i)
+    {
+        fprintf(out, "%.6f,%.6f,%d\n", data.points[i].x, data.points[i].y, data.points[i].cluster_id);
     }
-    fclose(outfile);
-    
-    printf("Resultados do clustering foram salvos em '%s'.\n", output_filename);
-    
-    free(data.points);
-    printf("\nConcluído.\n");
+    fclose(out);
 
+    free(data.points);
+    printf("Resultados em '%s'.\nConcluído.\n", output_filename);
     return 0;
 }
