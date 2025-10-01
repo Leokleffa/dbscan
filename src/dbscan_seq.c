@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <time.h>
+#include <stdarg.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -37,6 +39,47 @@ typedef struct
 // ============================================================================
 // AUXILIARES
 // ============================================================================
+
+// função utilitária para pegar tempo em segundos
+static inline double now_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static inline void progress_draw(const char *label, long long done, long long total, double *last_print_ts)
+{
+    if (total <= 0)
+        return;
+    double t = now_s();
+    if (*last_print_ts != 0 && t - *last_print_ts < 0.10)
+        return; // ~100 ms
+    *last_print_ts = t;
+
+    if (done > total)
+        done = total;
+    double frac = (double)done / (double)total;
+    int pct = (int)(frac * 100.0 + 0.5);
+
+    const int W = 40;
+    int filled = (int)(frac * W);
+    fprintf(stderr, "\r%s [", label);
+    for (int i = 0; i < W; ++i)
+        fputc(i < filled ? '#' : ' ', stderr);
+    fprintf(stderr, "] %3d%%", pct);
+    fflush(stderr);
+}
+
+static inline void progress_done(const char *label)
+{
+    const int W = 40;
+    fprintf(stderr, "\r%s [", label);
+    for (int i = 0; i < W; ++i)
+        fputc('#', stderr);
+    fprintf(stderr, "] 100%% ✓\n");
+    fflush(stderr);
+}
 
 // compara distância ao quadrado (evita sqrt/pow)
 static inline int within_epsilon2(const Point *p, const Point *q)
@@ -247,6 +290,7 @@ void expandCluster(int point_idx, int **neighbors_ptr, int *num_neighbors_ptr,
 void dbscan(Dataset *data)
 {
     int cluster_id = 1;
+    double last_print = 0.0; // para controle da taxa de atualização
 
     for (int i = 0; i < data->num_points; ++i)
     {
@@ -266,7 +310,13 @@ void dbscan(Dataset *data)
         expandCluster(i, &neighbors, &num_neighbors, cluster_id, data);
         free(neighbors);
         cluster_id++;
+
+        // atualização da barra de progresso
+        progress_draw("DBSCAN (seq)", (long long)(i + 1), (long long)data->num_points, &last_print);
     }
+
+    // finaliza barra
+    progress_done("DBSCAN (seq)");
 }
 
 // ============================================================================

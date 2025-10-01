@@ -13,6 +13,47 @@
 #include <string.h>
 #include <omp.h>
 
+/* =====================[ PROGRESS BAR - INÍCIO ]===================== */
+#include <time.h>
+static inline double now_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+static inline void progress_draw(const char *label, long long done, long long total, double *last_print_ts)
+{
+    if (total <= 0)
+        return;
+    double t = now_s();
+    if (*last_print_ts != 0.0 && t - *last_print_ts < 0.10)
+        return; // ~100ms
+    *last_print_ts = t;
+
+    if (done > total)
+        done = total;
+    double frac = (double)done / (double)total;
+    int pct = (int)(frac * 100.0 + 0.5);
+
+    const int W = 40;
+    int filled = (int)(frac * W);
+    fprintf(stderr, "\r%s [", label);
+    for (int i = 0; i < W; ++i)
+        fputc(i < filled ? '#' : ' ', stderr);
+    fprintf(stderr, "] %3d%%", pct);
+    fflush(stderr);
+}
+static inline void progress_done(const char *label)
+{
+    const int W = 40;
+    fprintf(stderr, "\r%s [", label);
+    for (int i = 0; i < W; ++i)
+        fputc('#', stderr);
+    fprintf(stderr, "] 100%% ✓\n");
+    fflush(stderr);
+}
+/* =====================[  PROGRESS BAR - FIM  ]===================== */
+
 // ============================================================================
 // PARÂMETROS E ESTRUTURAS
 // ============================================================================
@@ -152,7 +193,12 @@ static void dbscan(Dataset *data)
         exit(EXIT_FAILURE);
     }
 
-// ---------------- FASE 1: vizinhança + pontos core (paralela) ----------------
+    /* -------- PROGRESS: contadores globais e throttle -------- */
+    volatile long long prog_done = 0;
+    long long prog_total = 4LL * (long long)n; // aprox: F1(n) + F2(<=n) + F3A(n) + F3B(n)
+    double last_print = 0.0;
+
+    // ---------------- FASE 1: vizinhança + pontos core (paralela) ----------------
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < n; ++i)
     {
@@ -189,11 +235,24 @@ static void dbscan(Dataset *data)
         neighbor_counts[i] = used;
         if (used >= MIN_POINTS)
             is_core[i] = true;
+
+/* PROGRESS: +1 ponto processado na Fase 1 */
+#pragma omp atomic update
+        prog_done++;
+        if (omp_get_thread_num() == 0)
+            progress_draw("DBSCAN (par)", prog_done, prog_total, &last_print);
     }
 
     // ---------------- FASE 2: union de cores conectados (paralela) ---------------
     UnionFind uf;
     uf_init(&uf, n);
+
+    /* PROGRESS: saber quantos nós core existem para ajustar total real */
+    long long core_count = 0;
+    for (int i = 0; i < n; ++i)
+        if (is_core[i])
+            core_count++;
+    prog_total = 3LL * (long long)n + core_count; // total real = F1(n) + F2(core_count) + F3A(n) + F3B(n)
 
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < n; ++i)
@@ -210,6 +269,12 @@ static void dbscan(Dataset *data)
                 uf_union(&uf, i, j);
             }
         }
+
+/* PROGRESS: +1 para cada core processado na Fase 2 */
+#pragma omp atomic update
+        prog_done++;
+        if (omp_get_thread_num() == 0)
+            progress_draw("DBSCAN (par)", prog_done, prog_total, &last_print);
     }
 
     // Compressão de caminho paralela após unions
@@ -248,6 +313,12 @@ static void dbscan(Dataset *data)
         {
             data->points[i].cluster_id = NOISE; // começa como ruído
         }
+
+/* PROGRESS: +1 ponto rotulado na Fase 3A */
+#pragma omp atomic update
+        prog_done++;
+        if (omp_get_thread_num() == 0)
+            progress_draw("DBSCAN (par)", prog_done, prog_total, &last_print);
     }
 
 // ---------------- FASE 3B: atribuir rótulo aos borda (paralela) --------------
@@ -272,7 +343,16 @@ static void dbscan(Dataset *data)
             }
         }
         data->points[i].cluster_id = label;
+
+/* PROGRESS: +1 ponto rotulado na Fase 3B */
+#pragma omp atomic update
+        prog_done++;
+        if (omp_get_thread_num() == 0)
+            progress_draw("DBSCAN (par)", prog_done, prog_total, &last_print);
     }
+
+    /* PROGRESS: finalizar barra */
+    progress_done("DBSCAN (par)");
 
     // limpeza
     for (int i = 0; i < n; ++i)
