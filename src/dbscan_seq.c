@@ -37,6 +37,13 @@ typedef struct
 } Dataset;
 
 // ============================================================================
+// PROGRESSO (globais para o sequencial)
+// ============================================================================
+static long long g_labeled = 0;      // pontos já rotulados (inclui NOISE)
+static long long g_total_points = 0; // total de pontos do dataset
+static double g_last_print_ts = 0.0; // throttle ~100ms
+
+// ============================================================================
 // AUXILIARES
 // ============================================================================
 
@@ -249,7 +256,14 @@ int *regionQuery(int point_idx, const Dataset *data, int *num_neighbors)
 void expandCluster(int point_idx, int **neighbors_ptr, int *num_neighbors_ptr,
                    int cluster_id, Dataset *data)
 {
-    data->points[point_idx].cluster_id = cluster_id;
+    // Rotula o seed (se ainda não rotulado) e atualiza progresso
+    if (data->points[point_idx].cluster_id == UNCLASSIFIED ||
+        data->points[point_idx].cluster_id == NOISE)
+    {
+        data->points[point_idx].cluster_id = cluster_id;
+        g_labeled++;
+        progress_draw("DBSCAN (seq)", g_labeled, g_total_points, &g_last_print_ts);
+    }
 
     // percorre "fila" de vizinhos que vai crescendo
     for (int i = 0; i < *num_neighbors_ptr; ++i)
@@ -260,6 +274,8 @@ void expandCluster(int point_idx, int **neighbors_ptr, int *num_neighbors_ptr,
             data->points[current_point_idx].cluster_id == NOISE)
         {
             data->points[current_point_idx].cluster_id = cluster_id;
+            g_labeled++;
+            progress_draw("DBSCAN (seq)", g_labeled, g_total_points, &g_last_print_ts);
 
             int new_num_neighbors = 0;
             int *new_neighbors = regionQuery(current_point_idx, data, &new_num_neighbors);
@@ -290,7 +306,11 @@ void expandCluster(int point_idx, int **neighbors_ptr, int *num_neighbors_ptr,
 void dbscan(Dataset *data)
 {
     int cluster_id = 1;
-    double last_print = 0.0; // para controle da taxa de atualização
+
+    // Inicializa progresso global
+    g_total_points = data->num_points;
+    g_labeled = 0;
+    g_last_print_ts = 0.0;
 
     for (int i = 0; i < data->num_points; ++i)
     {
@@ -302,17 +322,18 @@ void dbscan(Dataset *data)
 
         if (!neighbors || num_neighbors < MIN_POINTS)
         {
+            // ponto isolado => NOISE
             data->points[i].cluster_id = NOISE;
+            g_labeled++;
+            progress_draw("DBSCAN (seq)", g_labeled, g_total_points, &g_last_print_ts);
             free(neighbors);
             continue;
         }
 
+        // Expande cluster a partir do seed i
         expandCluster(i, &neighbors, &num_neighbors, cluster_id, data);
         free(neighbors);
         cluster_id++;
-
-        // atualização da barra de progresso
-        progress_draw("DBSCAN (seq)", (long long)(i + 1), (long long)data->num_points, &last_print);
     }
 
     // finaliza barra
