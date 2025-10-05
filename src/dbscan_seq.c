@@ -98,7 +98,7 @@ static inline int within_epsilon2(const Point *p, const Point *q)
 
 // regionQuery paralela: varre todos os pontos e coleta vizinhos em buffers por thread
 // Retorna vetor alocado com índices de vizinhos (ou NULL se não houver).
-// num_neighbors é definido com a quantidade final.
+// num_neighbors é definido com a quantidade final (NÃO inclui o próprio ponto).
 int *regionQuery(int point_idx, const Dataset *data, int *num_neighbors)
 {
     *num_neighbors = 0;
@@ -141,12 +141,10 @@ int *regionQuery(int point_idx, const Dataset *data, int *num_neighbors)
         }
     }
 
-// Varredura paralela dos candidatos
 #ifdef _OPENMP
 #pragma omp parallel
     {
         int tid = omp_get_thread_num();
-
 #pragma omp for schedule(static)
         for (int i = 0; i < N; ++i)
         {
@@ -172,7 +170,6 @@ int *regionQuery(int point_idx, const Dataset *data, int *num_neighbors)
         }
     } // end parallel
 #else
-    // Sem OpenMP: executa sequencialmente (nt==1)
     for (int i = 0; i < N; ++i)
     {
         if (i == point_idx)
@@ -231,7 +228,6 @@ int *regionQuery(int point_idx, const Dataset *data, int *num_neighbors)
         return NULL;
     }
 
-    // Merge simples
     int offset = 0;
     for (int t = 0; t < nt; ++t)
     {
@@ -246,23 +242,101 @@ int *regionQuery(int point_idx, const Dataset *data, int *num_neighbors)
     free(local_used);
     free(local_cap);
 
-    *num_neighbors = total;
+    *num_neighbors = total; // não inclui o próprio ponto
     return neighbors;
 }
 
 // ============================================================================
 // ALGORITMO DBSCAN (expansão sequencial, como no original)
 // ============================================================================
+
+// Acrescenta à fila apenas vizinhos AINDA NÃO ENFILEIRADOS.
+// Usa o bitmap in_queue[N] para deduplicar pushes.
+static inline void append_unique_neighbors(int **queue_ptr, int *qsize_ptr,
+                                           const int *cand, int ncand,
+                                           unsigned char *in_queue, int N)
+{
+    if (!cand || ncand <= 0)
+        return;
+
+    // primeiro, conta quantos são realmente novos
+    int add = 0;
+    for (int k = 0; k < ncand; ++k)
+    {
+        int idx = cand[k];
+        if (idx < 0 || idx >= N)
+            continue;
+        if (!in_queue[idx])
+        {
+            in_queue[idx] = 1;
+            add++;
+        }
+    }
+    if (add == 0)
+        return;
+
+    // cresce a fila e insere na ordem que aparecer
+    int old = *qsize_ptr;
+    int *tmp = (int *)realloc(*queue_ptr, (size_t)(old + add) * sizeof(int));
+    if (!tmp)
+    {
+        // fallback: tenta malloc+copy (evita perder expansão)
+        tmp = (int *)malloc((size_t)(old + add) * sizeof(int));
+        if (!tmp)
+        {
+            fprintf(stderr, "Falta de memória ao expandir fila de vizinhos.\n");
+            exit(EXIT_FAILURE);
+        }
+        memcpy(tmp, *queue_ptr, (size_t)old * sizeof(int));
+        free(*queue_ptr);
+    }
+    *queue_ptr = tmp;
+
+    int w = old;
+    for (int k = 0; k < ncand; ++k)
+    {
+        int idx = cand[k];
+        if (idx < 0 || idx >= N)
+            continue;
+        // Só escreve os que marcamos como 1 acima; e volta a marcar 2 para
+        // não recontar se cand vier repetido em chamadas subsequentes
+        if (in_queue[idx] == 1)
+        {
+            (*queue_ptr)[w++] = idx;
+            in_queue[idx] = 2; // 2 = já escrito no buffer
+        }
+    }
+    *qsize_ptr = w;
+}
+
 void expandCluster(int point_idx, int **neighbors_ptr, int *num_neighbors_ptr,
                    int cluster_id, Dataset *data)
 {
-    // Rotula o seed (se ainda não rotulado) e atualiza progresso
+    const int N = data->num_points;
+
+    // Bitmap de "já enfileirado" para esta expansão
+    unsigned char *in_queue = (unsigned char *)calloc((size_t)N, 1);
+    if (!in_queue)
+    {
+        fprintf(stderr, "Falha ao alocar bitmap in_queue.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Seed: rotula e marca como já processado (não precisa entrar na fila)
     if (data->points[point_idx].cluster_id == UNCLASSIFIED ||
         data->points[point_idx].cluster_id == NOISE)
     {
         data->points[point_idx].cluster_id = cluster_id;
         g_labeled++;
         progress_draw("DBSCAN (seq)", g_labeled, g_total_points, &g_last_print_ts);
+    }
+
+    // Marca vizinhos iniciais como enfileirados
+    for (int i = 0; i < *num_neighbors_ptr; ++i)
+    {
+        int idx = (*neighbors_ptr)[i];
+        if (idx >= 0 && idx < N)
+            in_queue[idx] = 2; // já estão no buffer
     }
 
     // percorre "fila" de vizinhos que vai crescendo
@@ -280,27 +354,19 @@ void expandCluster(int point_idx, int **neighbors_ptr, int *num_neighbors_ptr,
             int new_num_neighbors = 0;
             int *new_neighbors = regionQuery(current_point_idx, data, &new_num_neighbors);
 
-            if (new_neighbors && new_num_neighbors >= MIN_POINTS)
+            // Se o vizinho é core (contando o próprio), anexa SEUS vizinhos,
+            // mas somente aqueles que ainda não estão na fila.
+            if (new_neighbors && (new_num_neighbors + 1) >= MIN_POINTS)
             {
-                int old = *num_neighbors_ptr;
-                *num_neighbors_ptr = old + new_num_neighbors;
-
-                int *tmp = (int *)realloc(*neighbors_ptr, (size_t)(*num_neighbors_ptr) * sizeof(int));
-                if (tmp)
-                {
-                    *neighbors_ptr = tmp;
-                    memcpy(&(*neighbors_ptr)[old], new_neighbors,
-                           (size_t)new_num_neighbors * sizeof(int));
-                }
-                else
-                {
-                    // se realloc falhar, mantém a fila original e ignora expansão
-                    *num_neighbors_ptr = old;
-                }
+                append_unique_neighbors(neighbors_ptr, num_neighbors_ptr,
+                                        new_neighbors, new_num_neighbors,
+                                        in_queue, N);
             }
             free(new_neighbors);
         }
     }
+
+    free(in_queue);
 }
 
 void dbscan(Dataset *data)
@@ -320,7 +386,8 @@ void dbscan(Dataset *data)
         int num_neighbors = 0;
         int *neighbors = regionQuery(i, data, &num_neighbors);
 
-        if (!neighbors || num_neighbors < MIN_POINTS)
+        // inclui o próprio ponto no critério de "core"
+        if (!neighbors || (num_neighbors + 1) < MIN_POINTS)
         {
             // ponto isolado => NOISE
             data->points[i].cluster_id = NOISE;
@@ -330,7 +397,7 @@ void dbscan(Dataset *data)
             continue;
         }
 
-        // Expande cluster a partir do seed i
+        // Expande cluster a partir do seed i (queue pode realocar)
         expandCluster(i, &neighbors, &num_neighbors, cluster_id, data);
         free(neighbors);
         cluster_id++;
@@ -397,7 +464,6 @@ int main(int argc, char *argv[])
     printf("Parâmetros: Epsilon = %.2f, MinPoints = %d\n", EPSILON, MIN_POINTS);
     printf("Total de pontos: %d\n\n", data.num_points);
 
-// executa DBSCAN
 #ifdef _OPENMP
     double t0 = omp_get_wtime();
 #endif

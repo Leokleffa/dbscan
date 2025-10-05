@@ -62,6 +62,9 @@ static inline void progress_done(const char *label)
 #define UNCLASSIFIED 0
 #define NOISE -1
 
+// Processamento em blocos para limitar pico de memória
+#define CHUNK_SIZE 50000
+
 typedef struct
 {
     double x, y;
@@ -183,11 +186,10 @@ static void dbscan(Dataset *data)
 {
     const int n = data->num_points;
 
-    // buffers: contagem de vizinhos, lista de vizinhos por ponto, e se é core
+    // buffers: contagem de vizinhos e se é core
     int *neighbor_counts = (int *)calloc((size_t)n, sizeof(int));
-    int **neighbors = (int **)xmalloc((size_t)n * sizeof(int *), "neighbors[]");
     bool *is_core = (bool *)calloc((size_t)n, sizeof(bool));
-    if (!neighbor_counts || !neighbors || !is_core)
+    if (!neighbor_counts || !is_core)
     {
         fprintf(stderr, "Falha ao alocar buffers principais\n");
         exit(EXIT_FAILURE);
@@ -195,48 +197,31 @@ static void dbscan(Dataset *data)
 
     /* -------- PROGRESS: contadores globais e throttle -------- */
     volatile long long prog_done = 0;
-    long long prog_total = 4LL * (long long)n; // aprox: F1(n) + F2(<=n) + F3A(n) + F3B(n)
+    // Aproximação: F1(n) + F2(n) + F3A(n) + F3B(n)  (unions contam por i core)
+    long long prog_total = 4LL * (long long)n;
     double last_print = 0.0;
 
     // ---------------- FASE 1: vizinhança + pontos core (paralela) ----------------
+    // Aqui não armazenamos listas de vizinhos; apenas contamos.
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < n; ++i)
     {
-        int cap = 64;
-        int used = 0;
-        int *list = (int *)xmalloc((size_t)cap * sizeof(int), "neighbors[i]");
-
         const Point *Pi = &data->points[i];
+        int used = 0;
+
+        // varredura completa (O(N)) para contar vizinhos
         for (int j = 0; j < n; ++j)
         {
             if (i == j)
                 continue;
             if (within_epsilon2(Pi, &data->points[j]))
-            {
-                if (used >= cap)
-                {
-                    int newcap = cap << 1;
-                    int *tmp = (int *)realloc(list, (size_t)newcap * sizeof(int));
-                    if (!tmp)
-                    {
-                        // fallback: mantém cap atual (raro), evita crash
-                    }
-                    else
-                    {
-                        list = tmp;
-                        cap = newcap;
-                    }
-                }
-                if (used < cap)
-                    list[used++] = j;
-            }
+                used++;
         }
-        neighbors[i] = list;
         neighbor_counts[i] = used;
         if (used >= MIN_POINTS)
             is_core[i] = true;
 
-/* PROGRESS: +1 ponto processado na Fase 1 */
+        /* PROGRESS: +1 ponto processado na Fase 1 */
 #pragma omp atomic update
         prog_done++;
         if (omp_get_thread_num() == 0)
@@ -247,34 +232,44 @@ static void dbscan(Dataset *data)
     UnionFind uf;
     uf_init(&uf, n);
 
-    /* PROGRESS: saber quantos nós core existem para ajustar total real */
-    long long core_count = 0;
-    for (int i = 0; i < n; ++i)
-        if (is_core[i])
-            core_count++;
-    prog_total = 3LL * (long long)n + core_count; // total real = F1(n) + F2(core_count) + F3A(n) + F3B(n)
+    // Processamos i em blocos de CHUNK_SIZE para reduzir pico e manter cache-friendly
+    for (int ib = 0; ib < n; ib += CHUNK_SIZE)
+    {
+        int i_end = ib + CHUNK_SIZE;
+        if (i_end > n)
+            i_end = n;
 
 #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; ++i)
-    {
-        if (!is_core[i])
-            continue;
-        int deg = neighbor_counts[i];
-        int *list = neighbors[i];
-        for (int k = 0; k < deg; ++k)
+        for (int i = ib; i < i_end; ++i)
         {
-            int j = list[k];
-            if (is_core[j])
+            if (!is_core[i])
             {
-                uf_union(&uf, i, j);
-            }
-        }
-
-/* PROGRESS: +1 para cada core processado na Fase 2 */
+                // ainda assim contamos progresso para manter barra suave
 #pragma omp atomic update
-        prog_done++;
-        if (omp_get_thread_num() == 0)
-            progress_draw("DBSCAN (par)", prog_done, prog_total, &last_print);
+                prog_done++;
+                if (omp_get_thread_num() == 0)
+                    progress_draw("DBSCAN (par)", prog_done, prog_total, &last_print);
+                continue;
+            }
+
+            const Point *Pi = &data->points[i];
+            // não guardamos vizinhos; aplicamos union on-the-fly
+            for (int j = 0; j < n; ++j)
+            {
+                if (i == j)
+                    continue;
+                if (!is_core[j])
+                    continue;
+                if (within_epsilon2(Pi, &data->points[j]))
+                    uf_union(&uf, i, j);
+            }
+
+            /* PROGRESS: +1 para cada i (core ou não) avaliado na Fase 2 */
+#pragma omp atomic update
+            prog_done++;
+            if (omp_get_thread_num() == 0)
+                progress_draw("DBSCAN (par)", prog_done, prog_total, &last_print);
+        }
     }
 
     // Compressão de caminho paralela após unions
@@ -295,12 +290,10 @@ static void dbscan(Dataset *data)
             continue;
         int r = uf.parent[i]; // já comprimido
         if (cluster_map[r] == 0)
-        {
             cluster_map[r] = next_cluster_id++;
-        }
     }
 
-// ---------------- FASE 3A: atribuir rótulo aos cores (paralela) --------------
+    // ---------------- FASE 3A: atribuir rótulo aos cores (paralela) --------------
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < n; ++i)
     {
@@ -314,50 +307,62 @@ static void dbscan(Dataset *data)
             data->points[i].cluster_id = NOISE; // começa como ruído
         }
 
-/* PROGRESS: +1 ponto rotulado na Fase 3A */
+        /* PROGRESS: +1 ponto rotulado na Fase 3A */
 #pragma omp atomic update
         prog_done++;
         if (omp_get_thread_num() == 0)
             progress_draw("DBSCAN (par)", prog_done, prog_total, &last_print);
     }
 
-// ---------------- FASE 3B: atribuir rótulo aos borda (paralela) --------------
-// cada não-core herda de QUALQUER vizinho core (primeiro que achar)
-#pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; ++i)
+    // ---------------- FASE 3B: atribuir rótulo aos borda (paralela) --------------
+    // cada não-core herda de QUALQUER vizinho core (primeiro que achar)
+    for (int ib = 0; ib < n; ib += CHUNK_SIZE)
     {
-        if (is_core[i])
-            continue;
-        int deg = neighbor_counts[i];
-        int *list = neighbors[i];
-        int label = NOISE;
+        int i_end = ib + CHUNK_SIZE;
+        if (i_end > n)
+            i_end = n;
 
-        for (int k = 0; k < deg; ++k)
+#pragma omp parallel for schedule(static)
+        for (int i = ib; i < i_end; ++i)
         {
-            int j = list[k];
-            if (is_core[j])
+            if (is_core[i])
             {
-                int r = uf.parent[j];
-                label = cluster_map[r];
-                break; // basta um core vizinho
-            }
-        }
-        data->points[i].cluster_id = label;
-
-/* PROGRESS: +1 ponto rotulado na Fase 3B */
+                // ainda assim contamos progresso para manter barra suave
 #pragma omp atomic update
-        prog_done++;
-        if (omp_get_thread_num() == 0)
-            progress_draw("DBSCAN (par)", prog_done, prog_total, &last_print);
+                prog_done++;
+                if (omp_get_thread_num() == 0)
+                    progress_draw("DBSCAN (par)", prog_done, prog_total, &last_print);
+                continue;
+            }
+
+            const Point *Pi = &data->points[i];
+            int label = NOISE; // será NOISE se não achar core
+            // busca on-the-fly por um vizinho core
+            for (int j = 0; j < n; ++j)
+            {
+                if (!is_core[j])
+                    continue;
+                if (within_epsilon2(Pi, &data->points[j]))
+                {
+                    int r = uf.parent[j];
+                    label = cluster_map[r];
+                    break; // basta um core vizinho
+                }
+            }
+            data->points[i].cluster_id = label;
+
+            /* PROGRESS: +1 ponto rotulado na Fase 3B */
+#pragma omp atomic update
+            prog_done++;
+            if (omp_get_thread_num() == 0)
+                progress_draw("DBSCAN (par)", prog_done, prog_total, &last_print);
+        }
     }
 
     /* PROGRESS: finalizar barra */
     progress_done("DBSCAN (par)");
 
     // limpeza
-    for (int i = 0; i < n; ++i)
-        free(neighbors[i]);
-    free(neighbors);
     free(neighbor_counts);
     free(is_core);
     free(cluster_map);
@@ -410,7 +415,8 @@ int main(int argc, char *argv[])
     fclose(in);
 
     printf("Iniciando DBSCAN Paralelo (OpenMP)\n");
-    printf("Parâmetros: Epsilon=%.3f  MinPoints=%d  N=%d\n", EPSILON, MIN_POINTS, data.num_points);
+    printf("Parâmetros: Epsilon=%.3f  MinPoints=%d  N=%d  Chunk=%d\n",
+           EPSILON, MIN_POINTS, data.num_points, CHUNK_SIZE);
 
     double t0 = omp_get_wtime();
     dbscan(&data);
